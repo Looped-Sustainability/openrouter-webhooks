@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+var buildRevision = "development"
+
 type config struct {
 	Addr, DataDir                                          string
 	EncryptionKey                                          []byte

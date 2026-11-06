@@ -16,3 +16,11 @@ Build a webhook proxy for OpenRouter text generation.
 Install test dependencies with `npm ci --ignore-scripts --legacy-peer-deps`.
 Run `go vet ./...`, `go test -race -count=1 -timeout=120s -v ./...`, and `go build ./...`.
 The running service uses Go only. Node.js is needed for SDK tests.
+
+# Deployment
+
+- Run this service in Docker Compose. The Hatchbox app is 14630, openrouter-webhooks.
+- Follow docs/hatchbox.md. The repo hook is .hatchbox/build. The attached web process is `docker compose up --no-build --remove-orphans`.
+- Use one application server and the persistent openrouter-webhooks-data volume. Never remove that volume during a release.
+- Preserve DATA_ENCRYPTION_KEY across releases. Caller tokens depend on it.
+- Verify deployment with `bin/check-deploy APP_ORIGIN FULL_COMMIT_SHA`. Require healthy status and an exact matching revision before reporting success.

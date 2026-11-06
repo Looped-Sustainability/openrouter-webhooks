@@ -19,4 +19,19 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 -timeout=120s -v ./...
       - run: go build ./...
-      - run: docker build -t openrouter-webhooks .
+      - name: Build and smoke-test Docker deployment
+        env:
+          DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          PORT: '18080'
+          REVISION: ${{ github.sha }}
+        run: |
+          docker compose config --quiet
+          docker compose up --build --detach --wait --wait-timeout 90
+          bin/check-deploy http://127.0.0.1:18080 "$REVISION"
+          docker compose exec -T web sh -c 'test "$(id -u)" = 10001 && test -w /data'
+      - name: Stop test containers
+        if: always()
+        env:
+          DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          PORT: '18080'
+        run: docker compose down --timeout 60

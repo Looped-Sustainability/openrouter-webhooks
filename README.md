@@ -253,24 +253,33 @@ Read-only upstream routes pass through with the caller's token. Other submission
 
 The proxy requires public HTTPS webhook destinations on port 443. It checks DNS addresses when it connects and blocks private and reserved networks. It does not use environment HTTP proxies.
 
-## Deploy and restart
+## Docker and Hatchbox deployment
+
+The app runs in Docker. `compose.yaml` builds the Go image, starts one non-root container, and stores jobs in the persistent `openrouter-webhooks-data` volume.
+
+With a valid encryption key in your private `.env`, run:
 
 ```sh
-docker build -t openrouter-webhooks .
-docker volume create openrouter-webhooks-data
-docker run --rm --name openrouter-webhooks \
-  --env-file .env \
-  -e DATA_DIR=/data \
-  -p 127.0.0.1:8080:8080 \
-  -v openrouter-webhooks-data:/data \
-  openrouter-webhooks
+docker compose up --build --detach --wait
+curl --fail http://127.0.0.1:8080/healthz
+docker compose down --timeout 60
 ```
 
-Put the API behind an HTTPS reverse proxy. Keep the same encryption key and persistent local disk across restarts. Storage must support atomic rename, file locks, and `fsync`.
+The server binds to `127.0.0.1:8080` by default. On Hatchbox, Compose uses the app's assigned `PORT` for that host binding. The container always listens on port 8080.
 
-Run one process per data directory. The service prevents a second process from opening the same directory. It does not coordinate replicas across servers.
+Follow [the Hatchbox setup instructions](docs/hatchbox.md) for [app 14630](https://hatchbox.io/apps/14630-openrouter-webhooks). The repo includes `.hatchbox/build`. The Hatchbox web process runs `docker compose up --no-build --remove-orphans` without detached mode.
 
-Queued jobs and pending webhook deliveries resume after restart. A model call that was running becomes `incomplete`; the proxy does not repeat it because the upstream outcome may be unknown. It refuses to start if it cannot decrypt queued caller tokens.
+Put the public app behind Hatchbox's HTTPS proxy. Verify the deployed commit with:
+
+```sh
+bin/check-deploy https://YOUR-APP.hatchboxapp.com FULL_COMMIT_SHA
+```
+
+`/healthz` returns `status` and the image's compiled `revision`. Local builds use `development` unless you set a build revision. CI builds and checks the Docker image with the commit SHA.
+
+Keep the same encryption key and persistent local volume across releases. Run one process on one application server. This queue does not coordinate replicas. Never delete its volume during redeployment.
+
+Queued jobs and webhook deliveries resume after restart. A model call that was running becomes `incomplete`; the proxy does not repeat it because the upstream outcome may be unknown. It refuses to start if it cannot decrypt queued caller tokens.
 
 Caller tokens use application encryption on disk. The service clears the encrypted credential from the job record after the model call ends. Prompts, outputs, webhook URLs, signing secrets, and token hashes also live in the job directory; keep storage and backups private. Job records stay in memory too. `MAX_JOBS` limits record count, not total bytes.
 

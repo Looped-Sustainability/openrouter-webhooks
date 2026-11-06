@@ -75,7 +75,7 @@ func (s *service) handler() http.Handler {
 			if s.failed.Load() {
 				apiError(w, 503, "storage failure")
 			} else {
-				writeJSON(w, 200, map[string]string{"status": "ok"})
+				writeJSON(w, 200, map[string]string{"status": "ok", "revision": buildRevision})
 			}
 			return
 		}

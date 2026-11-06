@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+: "${PORT:?Hatchbox must provide the app port}"
+: "${DATA_ENCRYPTION_KEY:?Set DATA_ENCRYPTION_KEY in the Hatchbox app environment}"
+: "${REVISION:?Hatchbox must provide the commit revision}"
+export REVISION
+
+# Check access as deploy before the build or any service interruption.
+docker info >/dev/null
+docker compose version >/dev/null
+docker compose config --quiet
+
+# Keep the existing container up if the new image cannot build.
+docker compose build --pull
+
+# Hatchbox restarts the attached web process after the build.
+# Keep the named jobs volume. Never add --volumes to this command.
+docker compose down --timeout 60
