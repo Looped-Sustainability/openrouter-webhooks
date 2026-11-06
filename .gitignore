@@ -1,0 +1,5 @@
+.env
+data/
+/openrouter-webhooks
+*.test
+coverage.out
