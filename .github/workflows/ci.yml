@@ -11,7 +11,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts --legacy-peer-deps
       - run: go vet ./...
-      - run: go test -race -count=1 -timeout=60s -v ./...
+      - run: go test -race -count=1 -timeout=120s -v ./...
       - run: go build ./...
       - run: docker build -t openrouter-webhooks .

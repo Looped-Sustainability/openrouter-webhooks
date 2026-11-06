@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -15,7 +15,8 @@ import (
 )
 
 type config struct {
-	Addr, DataDir, Token, OpenRouterKey, WebhookSecret     string
+	Addr, DataDir                                          string
+	EncryptionKey                                          []byte
 	WebhookHosts                                           map[string]bool
 	Workers, DeliveryWorkers, MaxJobs, MaxDeliveryAttempts int
 	ModelTimeout, WebhookTimeout, Retention                time.Duration
@@ -28,17 +29,16 @@ func env(key, fallback string) string {
 	return fallback
 }
 func loadConfig() (config, error) {
-	c := config{Addr: env("ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), Token: os.Getenv("API_TOKEN"), OpenRouterKey: os.Getenv("OPENROUTER_API_KEY"), WebhookSecret: os.Getenv("WEBHOOK_SECRET"), WebhookHosts: map[string]bool{}}
-	if len(c.Token) < 32 || len(c.WebhookSecret) < 32 || c.OpenRouterKey == "" {
-		return c, errors.New("API_TOKEN and WEBHOOK_SECRET must each have at least 32 characters; OPENROUTER_API_KEY is required")
+	c := config{Addr: env("ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), WebhookHosts: map[string]bool{}}
+	var err error
+	c.EncryptionKey, err = base64.StdEncoding.DecodeString(os.Getenv("DATA_ENCRYPTION_KEY"))
+	if err != nil || len(c.EncryptionKey) != 32 {
+		return c, errors.New("DATA_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
 	}
 	for _, host := range strings.Split(os.Getenv("WEBHOOK_HOSTS"), ",") {
 		if host = strings.ToLower(strings.TrimSpace(host)); host != "" {
 			c.WebhookHosts[host] = true
 		}
-	}
-	if len(c.WebhookHosts) == 0 {
-		return c, errors.New("WEBHOOK_HOSTS must list allowed webhook host names")
 	}
 	for _, item := range []struct {
 		key, def string
@@ -85,7 +85,7 @@ func run() error {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.start(workerCtx)
-	server := &http.Server{Addr: c.Addr, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	server := &http.Server{Addr: c.Addr, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	slog.Info("service ready", "address", c.Addr, "model_workers", c.Workers, "webhook_workers", c.DeliveryWorkers)
@@ -104,7 +104,4 @@ func run() error {
 	cancel()
 	s.wg.Wait()
 	return nil
-}
-func authorized(r *http.Request, token string) bool {
-	return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) == 1
 }

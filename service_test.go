@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +10,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
+
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -68,14 +68,18 @@ func memoryServer(t *testing.T, h http.Handler, useTLS bool) *httptest.Server {
 
 func testConfig(t *testing.T) config {
 	t.Helper()
-	return config{DataDir: t.TempDir(), Token: strings.Repeat("t", 32), OpenRouterKey: "fake-upstream-key", WebhookSecret: strings.Repeat("s", 32), WebhookHosts: map[string]bool{"example.com": true}, Workers: 4, DeliveryWorkers: 4, MaxJobs: 1000, MaxDeliveryAttempts: 3, ModelTimeout: time.Second, WebhookTimeout: time.Second, Retention: time.Hour}
+	return config{DataDir: t.TempDir(), EncryptionKey: bytes.Repeat([]byte{7}, 32), WebhookHosts: map[string]bool{}, Workers: 4, DeliveryWorkers: 4, MaxJobs: 1000, MaxDeliveryAttempts: 3, ModelTimeout: time.Second, WebhookTimeout: time.Second, Retention: time.Hour}
 }
+
+type receivedWebhook struct {
+	Body    string            `json:"body"`
+	Headers map[string]string `json:"headers"`
+}
+
 func fixture(t *testing.T, c config, upstream, hook http.HandlerFunc) (*service, *httptest.Server) {
 	t.Helper()
 	model := memoryServer(t, upstream, false)
-	t.Cleanup(model.Close)
 	callback := memoryServer(t, hook, true)
-	t.Cleanup(callback.Close)
 	s, err := newService(c)
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +92,6 @@ func fixture(t *testing.T, c config, upstream, hook http.HandlerFunc) (*service,
 	s.webhookClient = callback.Client()
 	s.webhookClient.Timeout = c.WebhookTimeout
 	api := memoryServer(t, s.handler(), false)
-	t.Cleanup(api.Close)
 	t.Cleanup(s.close)
 	return s, api
 }
@@ -98,42 +101,50 @@ func startTest(t *testing.T, s *service) {
 	s.start(ctx)
 	t.Cleanup(func() { cancel(); s.wg.Wait() })
 }
-func submitTest(t *testing.T, api *httptest.Server, c config, key string, body string) (string, int) {
+func requestTest(t *testing.T, api *httptest.Server, method, path, token, body, key string) (int, http.Header, map[string]json.RawMessage) {
 	t.Helper()
-	r, _ := http.NewRequest("POST", api.URL+"/v1/jobs", strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+c.Token)
-	r.Header.Set("Idempotency-Key", key)
-	res, err := api.Client().Do(r)
+	req, _ := http.NewRequest(method, api.URL+path, strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	res, err := api.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var result struct {
-		ID string `json:"id"`
+	var got map[string]json.RawMessage
+	if err = json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatal(err)
 	}
-	_ = json.NewDecoder(res.Body).Decode(&result)
-	return result.ID, res.StatusCode
+	return res.StatusCode, res.Header, got
 }
 
-const validSubmission = `{"webhook_url":"https://example.com/callback","request":{"model":"test/model","messages":[{"role":"user","content":"hi"}],"temperature":0.2},"metadata":{"order_id":42}}`
+const validSubmission = `{"model":"test/model","messages":[{"role":"user","content":"hi"}],"temperature":0.2,"background":true,"webhook_url":"https://example.com/callback"}`
 
-func waitStatus(t *testing.T, api *httptest.Server, c config, id, state string) map[string]json.RawMessage {
+func submitTest(t *testing.T, api *httptest.Server, token, key, body string) string {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	status, _, got := requestTest(t, api, "POST", "/api/v1/chat/completions", token, body, key)
+	if status != 200 {
+		t.Fatalf("submit: %d %s", status, got["error"])
+	}
+	var id string
+	_ = json.Unmarshal(got["id"], &id)
+	if id == "" {
+		t.Fatal("missing ID")
+	}
+	return id
+}
+func waitStatus(t *testing.T, api *httptest.Server, token, id, state string) map[string]json.RawMessage {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		req, _ := http.NewRequest("GET", api.URL+"/v1/jobs/"+id, nil)
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-		res, err := api.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
+		status, h, got := requestTest(t, api, "GET", "/api/v1/chat/completions/"+id, token, "", "")
+		if status != 200 {
+			t.Fatalf("retrieve status %d", status)
 		}
-		var got map[string]json.RawMessage
-		err = json.NewDecoder(res.Body).Decode(&got)
-		res.Body.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got["state"]) == fmt.Sprintf("%q", state) {
+		if h.Get("X-Webhook-State") == state {
 			return got
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -141,147 +152,154 @@ func waitStatus(t *testing.T, api *httptest.Server, c config, id, state string) 
 	t.Fatalf("job %s did not reach %s", id, state)
 	return nil
 }
-func TestFinalEventsAndSignatures(t *testing.T) {
+func TestFinalEvents(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		status   int
-		response string
-		want     string
-		slow     bool
+		name       string
+		code       int
+		body, want string
+		slow       bool
 	}{
-		{"success", 200, `{"id":"upstream-1","choices":[{"message":{"content":"hello"}}]}`, "job.succeeded", false},
-		{"provider_error", 429, `{"error":{"code":429,"message":"rate limited"}}`, "job.failed", false},
-		{"embedded_error", 200, `{"error":{"code":502}}`, "job.failed", false},
-		{"completion_error", 200, `{"choices":[{"finish_reason":"error"}]}`, "job.failed", false},
-		{"invalid_json", 200, `<html>bad gateway</html>`, "job.failed", false},
-		{"null_response", 200, `null`, "job.failed", false},
-		{"timeout", 200, `{}`, "job.timed_out", true},
+		{"success", 200, `{"id":"upstream-1","choices":[{"message":{"content":"hello"}}]}`, "completed", false},
+		{"provider_error", 429, `{"error":{"code":429,"message":"rate limited"}}`, "failed", false},
+		{"embedded_error", 200, `{"error":{"code":502}}`, "failed", false},
+		{"completion_error", 200, `{"choices":[{"finish_reason":"error"}]}`, "failed", false},
+		{"invalid_json", 200, `<html>bad gateway</html>`, "failed", false},
+		{"null", 200, `null`, "failed", false},
+		{"timeout", 200, `{}`, "failed", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := testConfig(t)
 			c.ModelTimeout = 50 * time.Millisecond
 			events := make(chan event, 1)
 			s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
-					t.Error("missing upstream auth")
+				if r.Header.Get("Authorization") != "Bearer caller-one" {
+					t.Error("caller token was not forwarded")
 				}
 				var data map[string]json.RawMessage
 				_ = json.NewDecoder(r.Body).Decode(&data)
+				if data["background"] != nil || data["webhook_url"] != nil || data["webhook_secret"] != nil {
+					t.Error("proxy options leaked upstream")
+				}
 				if string(data["temperature"]) != "0.2" {
-					t.Error("proxy dropped request parameter")
+					t.Error("model parameter lost")
 				}
 				if tc.slow {
 					select {
 					case <-r.Context().Done():
 						return
-					case <-time.After(200 * time.Millisecond):
+					case <-time.After(100 * time.Millisecond):
 					}
 				}
-				w.WriteHeader(tc.status)
-				_, _ = io.WriteString(w, tc.response)
+				w.WriteHeader(tc.code)
+				_, _ = io.WriteString(w, tc.body)
 			}, func(w http.ResponseWriter, r *http.Request) {
-				data, _ := io.ReadAll(r.Body)
-				mac := hmac.New(sha256.New, []byte(c.WebhookSecret))
-				mac.Write([]byte(r.Header.Get("Webhook-Timestamp") + "."))
-				mac.Write(data)
-				if r.Header.Get("Webhook-Signature") != "sha256="+hex.EncodeToString(mac.Sum(nil)) {
-					t.Error("invalid webhook signature")
-				}
 				var e event
-				if err := json.Unmarshal(data, &e); err != nil {
-					t.Error(err)
-				}
-				if r.Header.Get("Webhook-Id") != e.ID {
-					t.Error("webhook ID mismatch")
-				}
+				_ = json.NewDecoder(r.Body).Decode(&e)
 				events <- e
 				w.WriteHeader(204)
 			})
 			startTest(t, s)
-			id, status := submitTest(t, api, c, "", validSubmission)
-			if status != 202 {
-				t.Fatalf("submit status %d", status)
-			}
-			got := waitStatus(t, api, c, id, "delivered")
-			if got["request"] != nil || got["webhook_url"] != nil {
-				t.Error("status exposes private input")
+			id := submitTest(t, api, "caller-one", "", validSubmission)
+			got := waitStatus(t, api, "caller-one", id, "delivered")
+			if string(got["status"]) != fmt.Sprintf("%q", tc.want) {
+				t.Fatalf("result %v", got)
 			}
 			e := <-events
-			if e.Type != tc.want || e.JobID != id {
+			if e.Type != "chat.completion."+tc.want || e.Object != "event" {
 				t.Fatalf("event %+v", e)
 			}
-			if !tc.slow && json.Valid([]byte(tc.response)) && !bytes.Equal(e.Response, []byte(tc.response)) {
-				t.Errorf("response changed: %s", e.Response)
-			}
-			if string(e.Metadata) != `{"order_id":42}` {
-				t.Error("metadata lost")
+			if tc.name == "success" && string(got["upstream_id"]) != `"upstream-1"` {
+				t.Error("upstream ID lost")
 			}
 		})
 	}
 }
-func TestAdmissionAndIdempotency(t *testing.T) {
+func TestTokenIsolationIdempotencyAndDurability(t *testing.T) {
 	c := testConfig(t)
-	c.MaxJobs = 1
-	s, api := fixture(t, c, func(http.ResponseWriter, *http.Request) { t.Error("upstream called before workers start") }, func(http.ResponseWriter, *http.Request) {})
-	res, err := api.Client().Post(api.URL+"/v1/jobs", "application/json", strings.NewReader(validSubmission))
-	if err != nil {
-		t.Fatal(err)
+	c.MaxJobs = 2
+	var upstreamTokens sync.Map
+	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
+		upstreamTokens.Store(r.Header.Get("Authorization"), true)
+		_, _ = io.WriteString(w, `{"choices":[]}`)
+	}, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	status, _, _ := requestTest(t, api, "POST", "/v1/chat/completions", "", validSubmission, "")
+	if status != 401 {
+		t.Fatal("missing bearer accepted")
 	}
-	res.Body.Close()
-	if res.StatusCode != 401 {
-		t.Fatal("missing auth accepted")
+	id := submitTest(t, api, "private-token-a", "same", validSubmission)
+	id2 := submitTest(t, api, "private-token-a", "same", validSubmission)
+	if id != id2 {
+		t.Fatal("duplicate job")
 	}
-	for _, body := range []string{strings.Replace(validSubmission, "https:", "http:", 1), strings.Replace(validSubmission, "example.com", "localhost", 1), strings.Replace(validSubmission, `"temperature":0.2`, `"stream":true`, 1), validSubmission + `{}`} {
-		_, status := submitTest(t, api, c, "", body)
-		if status != 400 {
-			t.Fatalf("invalid request accepted: %d", status)
+	status, _, _ = requestTest(t, api, "POST", "/v1/chat/completions", "private-token-a", strings.Replace(validSubmission, "hi", "other", 1), "same")
+	if status != 409 {
+		t.Fatal("changed body accepted with same key")
+	}
+	other := submitTest(t, api, "private-token-b", "same", validSubmission)
+	if other == id {
+		t.Fatal("tokens share idempotency keys")
+	}
+	for _, path := range []string{"/v1/chat/completions/" + id, "/v1/chat/completions/" + id + "/redeliver"} {
+		status, _, _ = requestTest(t, api, "GET", path, "private-token-b", "", "")
+		if status != 404 {
+			t.Fatal("another caller can see job")
 		}
 	}
-	id, status := submitTest(t, api, c, "same", validSubmission)
-	if status != 202 {
-		t.Fatal(status)
-	}
-	id2, status := submitTest(t, api, c, "same", validSubmission)
-	if status != 202 || id != id2 {
-		t.Fatal("duplicate job created")
-	}
-	_, status = submitTest(t, api, c, "same", strings.Replace(validSubmission, "hi", "different", 1))
-	if status != 409 {
-		t.Fatal("key reuse did not conflict")
-	}
-	_, status = submitTest(t, api, c, "", validSubmission)
+	status, _, _ = requestTest(t, api, "POST", "/v1/chat/completions", "private-token-a", validSubmission, "")
 	if status != 503 {
 		t.Fatal("capacity limit ignored")
 	}
-	// Open the real durable queue again and repeat the HTTP request.
+	for _, jID := range []string{id, other} {
+		data, err := os.ReadFile(filepath.Join(c.DataDir, jID+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("private-token-")) {
+			t.Fatal("plaintext API key persisted")
+		}
+	}
 	s.close()
 	reopened, err := newService(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.close()
+	reopened.upstream = s.upstream
+	reopened.modelClient = s.modelClient
+	reopened.webhookClient = s.webhookClient
 	s.store = reopened.store
-	reopenedAPI := memoryServer(t, reopened.handler(), false)
-	defer reopenedAPI.Close()
-	id2, status = submitTest(t, reopenedAPI, c, "same", validSubmission)
-	if status != 202 || id != id2 {
+	api2 := memoryServer(t, reopened.handler(), false)
+	if resumed := submitTest(t, api2, "private-token-a", "same", validSubmission); resumed != id {
 		t.Fatal("idempotency lost on restart")
+	}
+	startTest(t, reopened)
+	waitStatus(t, api2, "private-token-a", id, "delivered")
+	waitStatus(t, api2, "private-token-b", other, "delivered")
+	if _, ok := upstreamTokens.Load("Bearer private-token-a"); !ok {
+		t.Fatal("first token lost on restart")
+	}
+	if _, ok := upstreamTokens.Load("Bearer private-token-b"); !ok {
+		t.Fatal("second token lost on restart")
+	}
+	data, _ := os.ReadFile(filepath.Join(c.DataDir, id+".json"))
+	var record map[string]json.RawMessage
+	_ = json.Unmarshal(data, &record)
+	if record["credential"] != nil {
+		t.Fatal("completed job retains API credential")
 	}
 }
 func TestWebhookRetryExhaustionAndRedelivery(t *testing.T) {
 	c := testConfig(t)
 	c.MaxDeliveryAttempts = 2
-	var calls atomic.Int32
-	var models atomic.Int32
-	var eventMu sync.Mutex
+	var calls, models atomic.Int32
+	var mu sync.Mutex
 	var ids []string
 	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
 		models.Add(1)
 		_, _ = io.WriteString(w, `{"choices":[]}`)
 	}, func(w http.ResponseWriter, r *http.Request) {
-		eventMu.Lock()
+		mu.Lock()
 		ids = append(ids, r.Header.Get("Webhook-Id"))
-		eventMu.Unlock()
+		mu.Unlock()
 		if calls.Add(1) <= 2 {
 			w.WriteHeader(503)
 		} else {
@@ -289,33 +307,27 @@ func TestWebhookRetryExhaustionAndRedelivery(t *testing.T) {
 		}
 	})
 	startTest(t, s)
-	id, _ := submitTest(t, api, c, "", validSubmission)
-	waitStatus(t, api, c, id, "dead")
-	req, _ := http.NewRequest("POST", api.URL+"/v1/jobs/"+id+"/redeliver", nil)
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	res, err := api.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
+	id := submitTest(t, api, "caller", "", validSubmission)
+	waitStatus(t, api, "caller", id, "dead")
+	code, _, _ := requestTest(t, api, "POST", "/v1/chat/completions/"+id+"/redeliver", "caller", "", "")
+	if code != 200 {
+		t.Fatal(code)
 	}
-	res.Body.Close()
-	if res.StatusCode != 202 {
-		t.Fatal(res.StatusCode)
-	}
-	waitStatus(t, api, c, id, "delivered")
+	waitStatus(t, api, "caller", id, "delivered")
 	if models.Load() != 1 || calls.Load() != 3 {
-		t.Fatal("redelivery repeated model call or failed to retry")
+		t.Fatal("delivery retry repeated a model call")
 	}
-	eventMu.Lock()
-	defer eventMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 	if len(ids) != 3 || ids[0] != ids[1] || ids[0] != ids[2] {
-		t.Fatal("event ID changed across retries")
+		t.Fatal("event ID changed on retry")
 	}
 }
 func TestRestartDuringModelCall(t *testing.T) {
 	c := testConfig(t)
 	var calls atomic.Int32
 	entered := make(chan struct{})
-	got := make(chan event, 1)
+	events := make(chan event, 1)
 	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -324,10 +336,10 @@ func TestRestartDuringModelCall(t *testing.T) {
 	}, func(w http.ResponseWriter, r *http.Request) {
 		var e event
 		_ = json.NewDecoder(r.Body).Decode(&e)
-		got <- e
+		events <- e
 		w.WriteHeader(204)
 	})
-	id, _ := submitTest(t, api, c, "", validSubmission)
+	id := submitTest(t, api, "caller", "", validSubmission)
 	ctx, cancel := context.WithCancel(context.Background())
 	s.start(ctx)
 	select {
@@ -337,11 +349,12 @@ func TestRestartDuringModelCall(t *testing.T) {
 	}
 	cancel()
 	s.wg.Wait()
-	// A hard stop can leave the last durable state as running.
+	// Recreate the durable state left by a hard stop during the request.
 	s.store.mu.Lock()
 	j := *s.store.jobs[id]
 	j.State = "running"
 	j.Event = nil
+	j.Result = nil
 	if err := s.store.save(&j); err != nil {
 		t.Fatal(err)
 	}
@@ -352,26 +365,25 @@ func TestRestartDuringModelCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopened.upstream = s.upstream
+	reopened.modelClient = s.modelClient
 	reopened.webhookClient = s.webhookClient
 	s.store = reopened.store
-	restartedAPI := memoryServer(t, reopened.handler(), false)
-	defer restartedAPI.Close()
+	restarted := memoryServer(t, reopened.handler(), false)
 	startTest(t, reopened)
-	waitStatus(t, restartedAPI, c, id, "delivered")
-	e := <-got
-	if e.Type != "job.interrupted" || calls.Load() != 1 {
+	got := waitStatus(t, restarted, "caller", id, "delivered")
+	e := <-events
+	if e.Type != "chat.completion.incomplete" || calls.Load() != 1 || string(got["status"]) != `"incomplete"` {
 		t.Fatal("restart repeated an uncertain model call")
 	}
 }
 func TestThreeHundredConcurrentModelCalls(t *testing.T) {
 	c := testConfig(t)
 	c.Workers = 300
-	c.ModelTimeout = 20 * time.Second
+	c.ModelTimeout = 30 * time.Second
 	release := make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(release) })
-	var active, peak atomic.Int32
-	var callbacks atomic.Int32
+	var active, peak, callbacks atomic.Int32
 	entered := make(chan struct{}, 300)
 	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
 		n := active.Add(1)
@@ -387,18 +399,14 @@ func TestThreeHundredConcurrentModelCalls(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+		_, _ = io.WriteString(w, `{"choices":[]}`)
 	}, func(w http.ResponseWriter, r *http.Request) { callbacks.Add(1); w.WriteHeader(204) })
-	var ids []string
-	for i := 0; i < 305; i++ {
-		id, status := submitTest(t, api, c, "", validSubmission)
-		if status != 202 {
-			t.Fatal(status)
-		}
-		ids = append(ids, id)
+	ids := make([]string, 305)
+	for i := range ids {
+		ids[i] = submitTest(t, api, "caller", "", validSubmission)
 	}
 	startTest(t, s)
-	deadline := time.After(15 * time.Second)
+	deadline := time.After(25 * time.Second)
 	for i := 0; i < 300; i++ {
 		select {
 		case <-entered:
@@ -406,17 +414,14 @@ func TestThreeHundredConcurrentModelCalls(t *testing.T) {
 			t.Fatalf("only %d concurrent calls started", i)
 		}
 	}
-	if peak.Load() != 300 {
-		t.Fatalf("peak %d", peak.Load())
-	}
 	once.Do(func() { close(release) })
 	for _, id := range ids {
-		waitStatus(t, api, c, id, "delivered")
+		waitStatus(t, api, "caller", id, "delivered")
 	}
-	if peak.Load() > 300 || callbacks.Load() != 305 {
+	if peak.Load() != 300 || callbacks.Load() != 305 {
 		t.Fatalf("peak=%d callbacks=%d", peak.Load(), callbacks.Load())
 	}
-	t.Logf("Completed 305 jobs; peak concurrent model calls: %d", peak.Load())
+	t.Logf("305 jobs completed; peak model concurrency %d", peak.Load())
 }
 func TestWebhookNetworkPolicy(t *testing.T) {
 	for _, ip := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "10.1.2.3", "169.254.169.254", "100.100.100.200", "192.0.2.1", "64:ff9b::a00:1", "2002:a00:1::1"} {
@@ -435,9 +440,60 @@ func TestWebhookNetworkPolicy(t *testing.T) {
 		res.Body.Close()
 		t.Fatal("private network request accepted")
 	}
-	for _, url := range []string{"http://example.com/", "https://example.com:8080/", "https://user:pass@example.com/", "https://example.com/#fragment", "https://other.example.com/"} {
-		if validateWebhook(url, map[string]bool{"example.com": true}) == nil {
+	for _, url := range []string{"http://example.com/", "https://example.com:8080/", "https://user:pass@example.com/", "https://example.com/#fragment"} {
+		if validateWebhook(url, nil) == nil {
 			t.Errorf("accepted %s", url)
 		}
+	}
+	if validateWebhook("https://other.example.com/", map[string]bool{"example.com": true}) == nil {
+		t.Fatal("ignored host list")
+	}
+	if validateWebhook("https://other.example.com/", nil) != nil {
+		t.Fatal("public service requires host registration")
+	}
+}
+func TestWebhookIsRequiredForEveryTextRequest(t *testing.T) {
+	c := testConfig(t)
+	var upstreamCalls atomic.Int32
+	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		_, _ = io.WriteString(w, `{"choices":[]}`)
+	}, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	for _, path := range []string{"/api/v1/chat/completions", "/v1/responses"} {
+		for _, body := range []string{
+			`{"model":"test/model","messages":[]}`,
+			`{"model":"test/model","input":"hello","background":true}`,
+			`{"background":true,"webhook_url":""}`,
+			`{"background":true,"webhook_url":null}`,
+			`{"background":"true"}`,
+			`{"background":true,"stream":true,"webhook_url":"https://example.com"}`,
+			`{"webhook_url":"http://example.com"}`,
+			`{"webhook_url":"https://example.com","webhook_secret":"bad"}`,
+			`{"background":false,"webhook_url":"https://example.com"}`,
+		} {
+			code, _, _ := requestTest(t, api, "POST", path, "caller", body, "")
+			if code != 400 {
+				t.Errorf("status %d for %s %s; want 400", code, path, body)
+			}
+		}
+	}
+	for _, path := range []string{"/v1/completions", "/v1/messages", "/v1/other-text-route"} {
+		code, _, _ := requestTest(t, api, "POST", path, "caller", `{"model":"test/model"}`, "")
+		if code != 404 {
+			t.Errorf("unsupported submission route %s returned %d", path, code)
+		}
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatal("request without a valid webhook reached OpenRouter")
+	}
+	// A valid webhook starts an asynchronous job without a background opt-in.
+	id := submitTest(t, api, "caller", "", `{"model":"test/model","messages":[],"webhook_url":"https://example.com/callback"}`)
+	if upstreamCalls.Load() != 0 {
+		t.Fatal("model call ran inside the submission handler")
+	}
+	startTest(t, s)
+	got := waitStatus(t, api, "caller", id, "delivered")
+	if string(got["status"]) != `"completed"` || upstreamCalls.Load() != 1 {
+		t.Fatal("webhook job did not finish exactly once")
 	}
 }

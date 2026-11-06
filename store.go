@@ -15,28 +15,33 @@ import (
 
 type event struct {
 	ID         string          `json:"id"`
-	JobID      string          `json:"job_id"`
+	Object     string          `json:"object"`
 	Type       string          `json:"type"`
-	CreatedAt  time.Time       `json:"created_at"`
+	CreatedAt  int64           `json:"created_at"`
+	Data       json.RawMessage `json:"data"`
 	StatusCode int             `json:"status_code,omitempty"`
-	Response   json.RawMessage `json:"response,omitempty"`
-	Error      string          `json:"error,omitempty"`
-	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 type job struct {
-	ID             string          `json:"id"`
-	State          string          `json:"state"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-	WebhookURL     string          `json:"webhook_url"`
-	Request        json.RawMessage `json:"request,omitempty"`
-	Metadata       json.RawMessage `json:"metadata,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	Fingerprint    string          `json:"fingerprint,omitempty"`
-	Event          *event          `json:"event,omitempty"`
-	Attempts       int             `json:"webhook_attempts"`
-	NextAttempt    time.Time       `json:"next_attempt,omitempty"`
-	DeliveryError  string          `json:"delivery_error,omitempty"`
+	Version        int                 `json:"version"`
+	ID             string              `json:"id"`
+	Owner          string              `json:"owner"`
+	Path           string              `json:"path"`
+	Model          string              `json:"model"`
+	State          string              `json:"state"`
+	CreatedAt      time.Time           `json:"created_at"`
+	UpdatedAt      time.Time           `json:"updated_at"`
+	WebhookURL     string              `json:"webhook_url,omitempty"`
+	WebhookSecret  string              `json:"webhook_secret,omitempty"`
+	Credential     string              `json:"credential,omitempty"`
+	Headers        map[string][]string `json:"headers,omitempty"`
+	Request        json.RawMessage     `json:"request,omitempty"`
+	Result         json.RawMessage     `json:"result,omitempty"`
+	IdempotencyKey string              `json:"idempotency_key,omitempty"`
+	Fingerprint    string              `json:"fingerprint,omitempty"`
+	Event          *event              `json:"event,omitempty"`
+	Attempts       int                 `json:"webhook_attempts"`
+	NextAttempt    time.Time           `json:"next_attempt,omitempty"`
+	DeliveryError  string              `json:"delivery_error,omitempty"`
 }
 type store struct {
 	mu   sync.Mutex
@@ -78,15 +83,13 @@ func openStore(dir string) (*store, error) {
 			return nil, err
 		}
 		var j job
-		if err = json.Unmarshal(data, &j); err != nil || j.ID == "" || filepath.Base(path) != j.ID+".json" {
+		if err = json.Unmarshal(data, &j); err != nil || j.Version != 2 || j.ID == "" || filepath.Base(path) != j.ID+".json" {
 			s.close()
-			return nil, fmt.Errorf("invalid job file %s", path)
+			return nil, fmt.Errorf("invalid or unsupported job file %s", path)
 		}
 		switch j.State {
 		case "running":
-			j.State = "delivering"
-			j.Request = nil
-			j.Event = &event{ID: newID(), JobID: j.ID, Type: "job.interrupted", CreatedAt: time.Now().UTC(), Error: "Process stopped during the model call. The upstream outcome is unknown.", Metadata: j.Metadata}
+			j.finish(nil, 0, "incomplete", "Process stopped during the model call. The upstream outcome is unknown.")
 			if err = s.save(&j); err != nil {
 				s.close()
 				return nil, err

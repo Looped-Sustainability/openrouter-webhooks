@@ -19,7 +19,7 @@ func validateWebhook(raw string, hosts map[string]bool) error {
 	if u.Port() != "" && u.Port() != "443" {
 		return errors.New("webhook_url must use port 443")
 	}
-	if !hosts[strings.ToLower(u.Hostname())] {
+	if len(hosts) > 0 && !hosts[strings.ToLower(u.Hostname())] {
 		return errors.New("webhook host is not allowed")
 	}
 	return nil
