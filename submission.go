@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -101,6 +102,7 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 					apiError(w, 409, "Idempotency-Key was already used with a different request")
 					return
 				}
+				slog.Info("job submission reused", "request_id", w.Header().Get("X-Request-Id"), "job_id", j.ID)
 				accepted(w, j)
 				return
 			}
@@ -130,6 +132,7 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 		apiError(w, 503, "could not persist job")
 		return
 	}
+	slog.Info("job queued", "request_id", w.Header().Get("X-Request-Id"), "job_id", j.ID, "route", j.Path)
 	accepted(w, j)
 }
 func accepted(w http.ResponseWriter, j *job) {
@@ -177,6 +180,7 @@ func (s *service) localJob(w http.ResponseWriter, r *http.Request, token, path, 
 			apiError(w, 503, "could not persist job")
 			return
 		}
+		slog.Info("webhook redelivery queued", "request_id", w.Header().Get("X-Request-Id"), "job_id", next.ID, "event_id", next.Event.ID)
 		accepted(w, &next)
 		return
 	}

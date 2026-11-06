@@ -70,7 +70,7 @@ func apiError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "proxy_error", "code": status}})
 }
 func (s *service) handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return accessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
 			if s.failed.Load() {
 				apiError(w, 503, "storage failure")
@@ -121,7 +121,7 @@ func (s *service) handler() http.Handler {
 			return
 		}
 		s.forward(w, r, path)
-	})
+	}))
 }
 func stripProxyHeaders(h http.Header) {
 	for key := range h {

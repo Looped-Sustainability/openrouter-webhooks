@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -32,6 +33,8 @@ func (s *service) complete(ctx context.Context, j *job) {
 	if !ok {
 		return
 	}
+	started := time.Now()
+	slog.Info("model request started", "job_id", j.ID, "route", j.Path)
 	var data []byte
 	statusCode := 0
 	status, message := "failed", "OpenRouter request failed"
@@ -70,14 +73,22 @@ func (s *service) complete(ctx context.Context, j *job) {
 	}
 	j.finish(data, statusCode, status, message)
 	s.store.mu.Lock()
-	s.persist(j)
+	ok = s.persist(j)
 	s.store.mu.Unlock()
+	if ok {
+		level := slog.LevelInfo
+		if status != "completed" {
+			level = slog.LevelWarn
+		}
+		slog.Log(ctx, level, "model request finished", "job_id", j.ID, "status", status, "upstream_status", statusCode, "duration_ms", time.Since(started).Milliseconds())
+	}
 }
 func (s *service) deliver(ctx context.Context, j *job) {
 	if ctx.Err() != nil {
 		return
 	}
 	if j.Attempts >= s.c.MaxDeliveryAttempts {
+		slog.Warn("webhook delivery exhausted", "job_id", j.ID, "event_id", j.Event.ID, "attempts", j.Attempts)
 		j.State = "dead"
 		s.store.mu.Lock()
 		s.persist(j)
@@ -91,6 +102,8 @@ func (s *service) deliver(ctx context.Context, j *job) {
 	if !ok {
 		return
 	}
+	started := time.Now()
+	slog.Info("webhook delivery started", "job_id", j.ID, "event_id", j.Event.ID, "attempt", j.Attempts)
 	data, _ := json.Marshal(j.Event)
 	stamp := strconv.FormatInt(time.Now().Unix(), 10)
 	key, err := signingKey(j.WebhookSecret)
@@ -135,6 +148,20 @@ func (s *service) deliver(ctx context.Context, j *job) {
 		}
 	}
 	s.store.mu.Lock()
-	s.persist(j)
+	ok = s.persist(j)
 	s.store.mu.Unlock()
+	if ok {
+		level := slog.LevelInfo
+		if j.State != "delivered" {
+			level = slog.LevelWarn
+		}
+		attrs := []any{"job_id", j.ID, "event_id", j.Event.ID, "attempt", j.Attempts, "webhook_status", status, "delivery_state", j.State, "duration_ms", time.Since(started).Milliseconds()}
+		if j.State == "delivering" {
+			attrs = append(attrs, "retry_at", j.NextAttempt)
+		}
+		if err != nil {
+			attrs = append(attrs, "request_failed", true)
+		}
+		slog.Log(ctx, level, "webhook delivery finished", attrs...)
+	}
 }

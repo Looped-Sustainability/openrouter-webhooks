@@ -231,6 +231,16 @@ This proxy requires a per-request webhook URL and includes the final result in t
 
 The current implementation does not support background streaming, stream resume, caller cancellation, or OpenAI's webhook registration API. It uses its own retention setting. These limits mean it does not implement every OpenAI background API operation.
 
+## Logs
+
+The service writes JSON logs to stdout. The attached Docker Compose process sends them to Hatchbox process logs.
+
+Each HTTP request, including `/healthz`, logs its method, route label, status, duration, and request ID. The response returns that ID in `X-Request-Id`. A rejected request without a webhook therefore appears as an HTTP 400 log entry.
+
+Accepted jobs log `job queued`, `model request started`, and `model request finished`. Each webhook attempt logs `webhook delivery started` and `webhook delivery finished`. Use `job_id` to follow a job. Delivery entries include the event ID, attempt number, HTTP status, delivery state, and next retry time when applicable.
+
+Request bodies, response bodies, caller tokens, signing secrets, webhook URLs, and query strings do not appear in these logs. Unknown request paths use a fixed route label. Request and delivery failures use warning or error levels.
+
 ## Configuration
 
 | Variable | Default | Purpose |
