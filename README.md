@@ -1,12 +1,19 @@
 # OpenRouter webhook proxy
 
-Use this service in place of `https://openrouter.ai/api/v1`.
+An OpenRouter proxy that adds required webhook delivery to text generation. It follows the OpenAI background-request workflow: submit a request, receive a queued response, and receive the final result through a webhook.
 
-This service adds required webhooks to OpenRouter text requests. Every chat completion or Responses request must include `webhook_url`. The proxy saves the job, returns a queued response, calls OpenRouter, and sends the final result or error to that URL.
+Replace `https://openrouter.ai/api/v1` with your proxy URL. Keep the normal model request body and your own OpenRouter bearer token. Add `webhook_url` to every text request.
 
-Each caller supplies their own OpenRouter token. There is no shared model account and no separate proxy API token. OpenRouter checks the token and charges that account. OpenAI and OpenRouter SDKs can call this proxy with an OpenRouter key.
+**No webhook URL means HTTP 400.** The proxy rejects the request before it calls OpenRouter. Every accepted text request runs in the background. There is no synchronous or polling-only text mode.
 
-OpenAI already has its own background requests and webhooks. It is only a reference for the client format and signing protocol. This service adds webhook delivery to OpenRouter text calls.
+## Request flow
+
+1. The caller sends a chat completion or Responses request with a webhook URL.
+2. The proxy saves the job and returns HTTP 200 with an ID and `status: "queued"`.
+3. A worker sends the model request to OpenRouter with the caller's token.
+4. The proxy sends the final result or error to the webhook. It retries failed delivery.
+
+The caller can also retrieve the job's status. Polling does not replace webhook delivery.
 
 ## Run
 
@@ -14,22 +21,78 @@ Use Go 1.25 or later on Linux or macOS.
 
 ```sh
 cp .env.example .env
-# Generate a key once. Save it as DATA_ENCRYPTION_KEY in .env.
 openssl rand -base64 32
+```
 
+Save the generated value as `DATA_ENCRYPTION_KEY` in `.env`. Generate this key once. Keep it across restarts.
+
+```sh
 set -a
 . ./.env
 set +a
 go run .
 ```
 
-Keep the encryption key stable across restarts. The service uses it to encrypt caller tokens for queued jobs. The service removes a job's encrypted token from its record when the model call ends. It refuses to start if it cannot decrypt queued credentials.
+The service listens on port 8080 by default. It does not load `.env` on its own.
 
-The service does not load `.env` on its own. Keep that file private.
+The server needs no shared OpenRouter key and no separate proxy API token. Each caller supplies an OpenRouter key. OpenRouter checks that key and charges its account. The OpenAI SDK can use an OpenRouter key with this proxy; an OpenAI API key does not grant OpenRouter access.
 
-## Send a text request
+## Submit a request
 
-Set the proxy base URL and add the required webhook destination. Keep the normal model request shape.
+```sh
+curl -sS http://localhost:8080/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: greeting-123' \
+  -d '{
+    "model": "openrouter/auto",
+    "messages": [{"role": "user", "content": "Write a short greeting."}],
+    "background": true,
+    "webhook_url": "https://hooks.example.com/result"
+  }'
+```
+
+The first response contains a queued chat completion. This example shows its main fields:
+
+```json
+{
+  "id": "chatcmpl_proxy_9c39b1d0c78c45df803e652359b72b02",
+  "object": "chat.completion",
+  "model": "openrouter/auto",
+  "status": "queued",
+  "background": true,
+  "choices": []
+}
+```
+
+The response also includes the fields that the SDK requires. The `Location` header gives the retrieval path. Responses requests use `object: "response"`, an empty `output` array, and a `resp_proxy_` ID.
+
+| Field | Behavior |
+| --- | --- |
+| `webhook_url` | Required. HTTPS on port 443, without URL credentials or a fragment. |
+| `background` | Optional. Omit it or set it to `true`. `false` is rejected. |
+| `stream` | Omit it or set it to `false`. `true` is rejected. |
+| `webhook_secret` | Optional signing secret. Supply one or save the generated secret from the response header. |
+
+The proxy removes these background and webhook options before it sends the model request to OpenRouter. The remaining model body goes to the matching upstream endpoint. There is no separate job request wrapper.
+
+Without `webhook_url` or its header equivalent, the proxy returns:
+
+```json
+{
+  "error": {
+    "message": "webhook_url is required for every text request",
+    "type": "proxy_error",
+    "code": 400
+  }
+}
+```
+
+URL checks at submission cover format, port, and the optional host list. DNS and public address checks run when the proxy connects for delivery. A supplied URL can therefore pass submission and later fail delivery.
+
+## OpenAI client
+
+This JavaScript example uses the official `openai` package with an OpenRouter key.
 
 ```js
 import OpenAI from 'openai';
@@ -39,15 +102,22 @@ const client = new OpenAI({
   baseURL: 'https://your-proxy.example/api/v1',
 });
 
-const completion = await client.chat.completions.create({
+const queued = await client.responses.create({
   model: 'openrouter/auto',
-  messages: [{ role: 'user', content: 'Write a short greeting.' }],
+  input: 'Write a short greeting.',
+  background: true,
   webhook_url: 'https://hooks.example.com/result',
   webhook_secret: process.env.MY_WEBHOOK_SECRET,
 });
+
+console.log(queued.id, queued.status);
 ```
 
-The OpenRouter SDK uses `serverURL` for the same setting.
+The same options work with `client.chat.completions.create()` and a normal `messages` array. These webhook fields are proxy extensions. In typed TypeScript, pass them through the SDK's request `headers` option as `X-Webhook-URL` and `X-Webhook-Secret`.
+
+## OpenRouter client
+
+The official `@openrouter/sdk` package removes unknown body fields. Pass the webhook URL through its supported header options.
 
 ```js
 import { OpenRouter } from '@openrouter/sdk';
@@ -57,172 +127,66 @@ const client = new OpenRouter({
   serverURL: 'https://your-proxy.example/api/v1',
 });
 
-const completion = await client.chat.send({
-  chatRequest: {
-    model: 'openrouter/auto',
-    messages: [{ role: 'user', content: 'Write a short greeting.' }],
-  },
-}, {
-  fetchOptions: {
-    headers: {
-      'X-Webhook-URL': 'https://hooks.example.com/result',
-      'X-Webhook-Secret': process.env.MY_WEBHOOK_SECRET,
-    },
-  },
-});
-```
-
-The `/v1` prefix is an alias for `/api/v1`. Text requests always run asynchronously. Missing, empty, or invalid webhook destinations return HTTP 400 before the service calls OpenRouter. `stream: true` and `background: false` also return HTTP 400.
-
-## Required webhook delivery
-
-Add `webhook_url` to every chat completion or Responses request. The proxy always runs the call in the background. `background: true` is optional and accepted for client compatibility. There is no synchronous text mode or polling-only mode.
-
-```sh
-curl -sS https://your-proxy.example/api/v1/responses \
-  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: order-123-summary' \
-  -d '{
-    "model": "openrouter/auto",
-    "input": "Write a short greeting.",
-    "background": true,
-    "webhook_url": "https://hooks.example.com/result"
-  }'
-```
-
-The service returns HTTP 200 after it saves the job to disk. It returns a queued response in the endpoint's native format. This lets the strict OpenRouter SDK parse it.
-
-```json
-{
-  "id": "resp_proxy_9c39b1d0c78c45df803e652359b72b02",
-  "object": "response",
-  "status": "queued",
-  "background": true,
-  "model": "openrouter/auto",
-  "output": []
-}
-```
-
-The response includes other native fields that the SDK requires. Chat completion jobs have a `chatcmpl_proxy_` ID, an empty `choices` array, and the same `status` extension.
-
-The proxy handles `background`, `webhook_url`, and `webhook_secret`. It removes them before it calls OpenRouter. It sends the remaining model request to the same upstream endpoint in the foreground. It does not ask OpenRouter to create another background job.
-
-Use the same body and `Idempotency-Key` when you retry a submission. A retry returns the original job. A changed body with that key returns HTTP 409. Keys apply within one caller token. Different tokens can use the same key. This protection lasts until the job expires.
-
-For webhook jobs, supply your own `webhook_secret`, or save the generated secret from the initial response's `X-Webhook-Secret` header. A secret uses the Standard Webhooks format, `whsec_` followed by base64 for at least 32 random bytes.
-
-## OpenAI client with a background webhook
-
-The JavaScript SDK sends these proxy fields as part of the request.
-
-```js
-const response = await client.responses.create({
-  model: 'openrouter/auto',
-  input: 'Write a short greeting.',
-  background: true,
-  webhook_url: 'https://hooks.example.com/result',
-  webhook_secret: process.env.MY_WEBHOOK_SECRET,
-});
-
-const current = await client.responses.retrieve(response.id);
-```
-
-In typed TypeScript, use the header options shown below for custom proxy fields. In the OpenAI Python SDK, use `extra_body`.
-
-```python
-from openai import OpenAI
-import os
-
-client = OpenAI(
-    api_key=os.environ['OPENROUTER_API_KEY'],
-    base_url='https://your-proxy.example/api/v1',
-)
-response = client.responses.create(
-    model='openrouter/auto',
-    input='Write a short greeting.',
-    background=True,
-    extra_body={
-        'webhook_url': 'https://hooks.example.com/result',
-        'webhook_secret': os.environ['MY_WEBHOOK_SECRET'],
-    },
-)
-```
-
-## OpenRouter client with a background webhook
-
-The OpenRouter SDK validates requests and removes unknown fields. Use these headers through its supported request options.
-
-```js
-const response = await client.beta.responses.send(
+const queued = await client.chat.send(
   {
-    responsesRequest: {
+    chatRequest: {
       model: 'openrouter/auto',
-      input: 'Write a short greeting.',
+      messages: [{ role: 'user', content: 'Write a short greeting.' }],
     },
   },
   {
     fetchOptions: {
       headers: {
-        'X-Background': 'true',
         'X-Webhook-URL': 'https://hooks.example.com/result',
         'X-Webhook-Secret': process.env.MY_WEBHOOK_SECRET,
       },
     },
   },
 );
+
+console.log(queued.id);
 ```
 
-The same headers work with `client.chat.send({ chatRequest: ... }, options)` and with the OpenAI client's `headers` request option. They do not go to OpenRouter. They have the same meaning as the JSON proxy fields. Header values take precedence if both forms are present.
+For Responses, use `client.beta.responses.send({ responsesRequest: { model, input } }, options)` with the same header options. The proxy accepts `X-Background: true`, but it is optional. Text calls always run asynchronously.
 
-## Poll or retry a delivery
+A nonempty webhook header overrides its matching JSON field. The proxy removes these headers before it calls OpenRouter. The OpenRouter SDK removes unknown response fields too, so use the retrieval endpoint to inspect the added chat completion `status` field.
 
-Use the same caller token to retrieve a job.
+## Receive and verify the webhook
 
-```sh
-curl -sS "https://your-proxy.example/api/v1/responses/$RESPONSE_ID" \
-  -H "Authorization: Bearer $OPENROUTER_API_KEY"
-```
-
-For chat completions, use `/api/v1/chat/completions/$RESPONSE_ID`. The OpenAI SDK supports `responses.retrieve(id)` and `chat.completions.retrieve(id)`.
-
-The status starts at `queued`, changes to `in_progress`, and ends at `completed`, `failed`, `incomplete`, or `cancelled` if the provider returned that state. The final result keeps the proxy ID. Its `upstream_id` field holds OpenRouter's original ID. A caller with another token receives HTTP 404.
-
-`X-Webhook-State` shows delivery state. It can be `queued`, `running`, `delivering`, `delivered`, or `dead`. A completed model response can still have a failed webhook delivery. The model result stays available for polling.
-
-After delivery attempts run out, retry only the webhook with:
-
-```sh
-curl -sS -X POST \
-  "https://your-proxy.example/api/v1/responses/$RESPONSE_ID/redeliver" \
-  -H "Authorization: Bearer $OPENROUTER_API_KEY"
-```
-
-This sends the same event ID. It does not repeat the model call. The chat completion route supports the same `/redeliver` suffix.
-
-## Verify a webhook
-
-A webhook event follows the Standard Webhooks signing format. Unlike OpenAI's notification-only payload, its `data` field contains the full final result.
+The webhook receives an event with the full final result in `data`. A chat completion event looks like this; the result here is shortened:
 
 ```json
 {
   "object": "event",
   "id": "evt_7df1da47aebc47f5bdaab9c4637c6b72",
-  "type": "response.completed",
+  "type": "chat.completion.completed",
   "created_at": 1794000000,
   "status_code": 200,
   "data": {
-    "id": "resp_proxy_9c39b1d0c78c45df803e652359b72b02",
-    "object": "response",
+    "id": "chatcmpl_proxy_9c39b1d0c78c45df803e652359b72b02",
+    "upstream_id": "gen-example",
+    "object": "chat.completion",
     "status": "completed",
-    "output": []
+    "background": true,
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}]
   }
 }
 ```
 
-Responses events use `response.completed`, `response.failed`, `response.incomplete`, or `response.cancelled`. Chat completion events use the custom `chat.completion.` prefix with the same final states.
+The result keeps the proxy job ID. `upstream_id` holds OpenRouter's original ID when available. Model output, usage, and upstream error details remain in the result. `status_code` records the upstream HTTP status when available; transport failures may have none.
 
-The official OpenAI SDK verifies these signatures.
+| Final status | Responses event | Chat completion event |
+| --- | --- | --- |
+| `completed` | `response.completed` | `chat.completion.completed` |
+| `failed` | `response.failed` | `chat.completion.failed` |
+| `incomplete` | `response.incomplete` | `chat.completion.incomplete` |
+| `cancelled` | `response.cancelled` | `chat.completion.cancelled` |
+
+A model timeout produces `failed`. A process stop during a model call produces `incomplete`. The proxy can preserve a provider's `cancelled` result, but it has no caller cancellation operation.
+
+Use a signing secret with at least 32 random bytes encoded as base64. The usual format is `whsec_` followed by that value. A bare base64 value also works. If you omit `webhook_secret`, save the generated value from the initial response's `X-Webhook-Secret` header.
+
+The official OpenAI SDK verifies the webhook signature:
 
 ```js
 const event = await client.webhooks.unwrap(
@@ -232,41 +196,64 @@ const event = await client.webhooks.unwrap(
 );
 ```
 
-The proxy signs `webhook-id`, a period, `webhook-timestamp`, a period, and the exact body bytes with HMAC-SHA256. It sends the digest as `webhook-signature: v1,<base64>`. Keep the request body unchanged until you verify it. The OpenAI SDK also checks timestamp age.
+Pass the exact raw body before JSON parsing. The proxy uses Standard Webhooks headers: `webhook-id`, `webhook-timestamp`, and `webhook-signature`. It signs `id.timestamp.body` with HMAC-SHA256 and sends `v1,<base64 digest>`. The SDK checks the signature and timestamp age.
 
-Return a 2xx status after you save the event. Deduplicate events by `webhook-id`. A lost response or a process stop can cause another delivery.
+Save the event, then return a 2xx status. Deduplicate by `webhook-id`. The same event can arrive more than once if an HTTP response is lost or a process stops during delivery.
 
-The proxy retries network failures and all non-2xx responses. It does not follow redirects. It uses exponential delays with jitter and makes at most 12 attempts by default. It does not repeat model calls. This avoids a second charge after an unknown upstream outcome. Rate limit errors therefore produce a final error result.
+## Status and delivery retries
 
-## Scope
+Use the same caller token to retrieve a job. Both base URL prefixes work.
 
-The proxy adds webhook delivery to OpenRouter text requests. It accepts OpenAI-compatible request shapes so both SDKs can call it. It does not add webhook support to OpenAI or reproduce OpenAI's webhook registry.
+| Method | Path under `/api/v1` or `/v1` | Purpose |
+| --- | --- | --- |
+| `POST` | `/chat/completions` | Queue a chat completion with a required webhook. |
+| `POST` | `/responses` | Queue a Responses request with a required webhook. |
+| `GET` | `/chat/completions/{id}` | Retrieve a chat completion job. |
+| `GET` | `/responses/{id}` | Retrieve a Responses job. |
+| `POST` | `/chat/completions/{id}/redeliver` | Retry an exhausted webhook delivery. |
+| `POST` | `/responses/{id}/redeliver` | Retry an exhausted webhook delivery. |
 
-Polling checks a webhook job's status. It never replaces the required webhook. Background streaming, stream resume, and cancellation are not implemented. Model calls do not stream to the caller. Their final response goes to the supplied webhook URL.
+The OpenAI SDK supports `client.responses.retrieve(id)` and `client.chat.completions.retrieve(id)`. Status moves from `queued` to `in_progress`, then to a final status. Another caller's token receives HTTP 404.
 
-## Settings
+The retrieval response's `X-Webhook-State` header reports delivery state: `queued`, `running`, `delivering`, `delivered`, or `dead`. Model completion and webhook delivery are separate. A completed result can still await delivery.
+
+The proxy retries network failures and every non-2xx webhook response. It uses exponential delays with jitter and does not follow redirects. After `WEBHOOK_ATTEMPTS` attempts, delivery becomes `dead`. Call the matching `/redeliver` endpoint to reset its delivery budget. Redelivery keeps the event ID and does not call the model again.
+
+Model calls do not retry automatically. An upstream error, including an invalid key or rate limit, becomes a failed result and webhook event. The queued acceptance response does not prove that OpenRouter accepted the token or model request.
+
+Use `Idempotency-Key` to retry submission without creating another job. Within one caller token, the same endpoint, model body, webhook URL, and supplied signing secret return the existing job. Changed values with the same key return HTTP 409. Keep the same key and request on retries. This protection ends when the job expires.
+
+## OpenAI background compatibility
+
+The supported workflow follows OpenAI's [background requests](https://developers.openai.com/api/docs/guides/background) and [signed webhooks](https://developers.openai.com/api/docs/guides/webhooks): queued responses, status retrieval, terminal events, and OpenAI SDK signature verification.
+
+This proxy requires a per-request webhook URL and includes the final result in the event. OpenAI configures webhook destinations separately. Chat completion background jobs and `chat.completion.*` events are proxy extensions.
+
+The current implementation does not support background streaming, stream resume, caller cancellation, or OpenAI's webhook registration API. It uses its own retention setting. These limits mean it does not implement every OpenAI background API operation.
+
+## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATA_ENCRYPTION_KEY` | Required | Base64-encoded 32-byte key for queued caller credentials. |
 | `ADDR` | `:8080` | HTTP listen address. |
-| `DATA_DIR` | `./data` | Durable job storage. |
-| `WEBHOOK_HOSTS` | Empty | Optional comma-separated list of exact allowed host names. Empty allows any public HTTPS host. |
-| `MODEL_CONCURRENCY` | `300` | Maximum active model calls. |
-| `WEBHOOK_CONCURRENCY` | `50` | Maximum active delivery attempts. |
-| `MODEL_TIMEOUT` | `10m` | Timeout for a model call. Foreground timeouts include time waiting for a slot. |
+| `DATA_DIR` | `./data` | Durable job directory. |
+| `WEBHOOK_HOSTS` | Empty | Optional comma-separated exact host list. Empty allows any public HTTPS host. |
+| `MODEL_CONCURRENCY` | `300` | Shared concurrency limit for model calls and read-only upstream requests. |
+| `WEBHOOK_CONCURRENCY` | `50` | Maximum concurrent delivery attempts. |
+| `MODEL_TIMEOUT` | `10m` | Timeout for each upstream HTTP call. Queue wait is separate for text jobs. |
 | `WEBHOOK_TIMEOUT` | `15s` | Timeout for each delivery attempt. |
-| `WEBHOOK_ATTEMPTS` | `12` | Delivery attempt limit. |
+| `WEBHOOK_ATTEMPTS` | `12` | Delivery attempt budget. |
 | `MAX_JOBS` | `10000` | Maximum stored jobs, including finished jobs. |
-| `RETENTION` | `24h` | Retention period after delivery ends or attempts run out. |
+| `RETENTION` | `24h` | Retention after delivery succeeds or attempts run out. |
 
-Text requests have a 1 MiB body limit. Model responses have a 16 MiB limit. Read-only OpenRouter routes pass through. Other submission routes return HTTP 404, so they cannot bypass the text webhook flow.
+Text request bodies have a 1 MiB limit. Model responses have a 16 MiB limit. A full store returns HTTP 503 with `Retry-After: 60`. Pending jobs do not expire. Terminal job cleanup also removes its result and idempotency record.
 
-A full job store returns HTTP 503 with `Retry-After: 60`. Expired terminal jobs are deleted automatically. Pending jobs do not expire. The service holds job records in memory and on disk. The job count limit does not bound total bytes. Large outputs need more memory and disk space.
+Read-only upstream routes pass through with the caller's token. Other submission routes return HTTP 404. `GET /healthz` needs no token. It returns HTTP 503 after a storage failure; the proxy then stops text admission and scheduling until restart.
 
-`GET /healthz` needs no token. It returns HTTP 503 after a storage failure. The service then stops text job admission and scheduling. Repair storage and restart the service.
+The proxy requires public HTTPS webhook destinations on port 443. It checks DNS addresses when it connects and blocks private and reserved networks. It does not use environment HTTP proxies.
 
-## Deploy
+## Deploy and restart
 
 ```sh
 docker build -t openrouter-webhooks .
@@ -279,21 +266,19 @@ docker run --rm --name openrouter-webhooks \
   openrouter-webhooks
 ```
 
-Put the API behind an HTTPS reverse proxy. Keep the same data encryption key and persistent disk across restarts. Use local storage with atomic rename, file locks, and working `fsync`.
+Put the API behind an HTTPS reverse proxy. Keep the same encryption key and persistent local disk across restarts. Storage must support atomic rename, file locks, and `fsync`.
 
-Run one process per data directory. A file lock prevents a second process from opening it. This version supports hundreds of concurrent calls on one server. It needs a shared queue before you add replicas.
+Run one process per data directory. The service prevents a second process from opening the same directory. It does not coordinate replicas across servers.
 
-The service resumes queued jobs and pending deliveries after restart. If a model call was in progress when the process stopped, it creates an `incomplete` result and does not repeat the call. The original upstream outcome may be unknown.
+Queued jobs and pending webhook deliveries resume after restart. A model call that was running becomes `incomplete`; the proxy does not repeat it because the upstream outcome may be unknown. It refuses to start if it cannot decrypt queued caller tokens.
 
-Webhook destinations must use HTTPS on port 443. The service resolves and checks the address when it connects. It blocks private and reserved networks. It does not follow redirects or use environment HTTP proxies. Caller tokens, webhook secrets, and response bodies never go into service logs.
+Caller tokens use application encryption on disk. The service clears the encrypted credential from the job record after the model call ends. Prompts, outputs, webhook URLs, signing secrets, and token hashes also live in the job directory; keep storage and backups private. Job records stay in memory too. `MAX_JOBS` limits record count, not total bytes.
 
-Job files contain prompts, responses, webhook URLs, signing secrets, and caller token hashes. Only caller credentials use application encryption. Keep the disk and backups private. The service makes no claim that file updates erase old disk blocks.
-
-The queue format is version 2. It cannot load version 1 job files from the earlier service-token prototype. Keep that old data separate if you need it. Do not point this version at an active version 1 queue.
+The queue uses format version 2. It cannot load version 1 records from the original shared-token prototype.
 
 ## Verify
 
-Use Node.js 22 or later for the SDK tests. The running Go service has no Node.js dependency.
+Use Node.js 22 or later for the SDK tests. The running service needs Go only.
 
 ```sh
 npm ci --ignore-scripts --legacy-peer-deps
@@ -302,6 +287,6 @@ go test -race -count=1 -timeout=120s -v ./...
 go build ./...
 ```
 
-The tests use the actual pinned `openai` and `@openrouter/sdk` packages. They send requests through the Go handler to local test providers. The SDK tests check that neither client can bypass the webhook requirement. They also cover asynchronous chat and Responses requests, polling, separate caller tokens, upstream errors, and OpenAI SDK webhook signature checks. A regression test checks that requests without valid webhook destinations never reach OpenRouter.
+Tests use the pinned official `openai` and `@openrouter/sdk` packages. They cover required webhook rejection, asynchronous chat and Responses calls, token isolation, status retrieval, errors, and signature verification. Queue tests also cover delivery retries, restart recovery, encrypted credentials, and 300 simultaneous model calls.
 
-The queue tests cover 300 simultaneous model calls, delivery retries, restart recovery, encrypted credentials, token isolation, idempotency, and network address checks. They run HTTP and TLS over in-memory connections. No paid OpenRouter or OpenAI calls are part of these tests.
+The tests use local providers and HTTP/TLS connections in memory. They make no paid OpenRouter or OpenAI calls. The concurrency test proves local proxy behavior; production capacity also depends on the server and OpenRouter account limits.
