@@ -49,6 +49,8 @@ openssl rand -base64 32
 
 If this app already has a key and queued jobs, retain that key. Replacing it prevents the service from decrypting queued caller tokens. Hatchbox does not return saved environment values through its API.
 
+Set `ADMIN_TOKEN` in the Hatchbox app environment. Use the same value in your private `.env` for `bin/admin_api`. Generate it with `openssl rand -base64 32`. Leave it empty to disable `GET /admin/jobs`. This is not `DATA_ENCRYPTION_KEY`. Compose passes `ADMIN_TOKEN` into the container. Put `ADMIN_API_HOST` only in `.env` on the machine that runs `bin/admin_api`. The server does not read it.
+
 The other settings have defaults in `compose.yaml`. Optional settings include `MODEL_CONCURRENCY`, `WEBHOOK_CONCURRENCY`, `MODEL_TIMEOUT`, and `WEBHOOK_HOSTS`.
 
 Do not add a shared `OPENROUTER_API_KEY` or proxy `API_TOKEN`. Callers supply their own OpenRouter tokens.

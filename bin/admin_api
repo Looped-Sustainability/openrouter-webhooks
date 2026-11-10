@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [[ -f "$root/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$root/.env"
+  set +a
+fi
+
+usage() {
+  echo "Usage: bin/admin_api ls" >&2
+  echo "       bin/admin_api show JOB_ID" >&2
+  echo "Put ADMIN_TOKEN and ADMIN_API_HOST in .env. ADMIN_TOKEN matches the server." >&2
+  exit 2
+}
+
+if [[ -z "${ADMIN_TOKEN:-}" || -z "${ADMIN_API_HOST:-}" ]]; then
+  usage
+fi
+
+origin="${ADMIN_API_HOST%/}"
+case "${1:-}" in
+  ls)
+    if [[ $# -ne 1 ]]; then
+      usage
+    fi
+    curl --fail --silent --show-error \
+      --connect-timeout 5 --max-time 60 \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+      "${origin}/admin/jobs"
+    ;;
+  show)
+    if [[ $# -ne 2 || -z "${2:-}" ]]; then
+      usage
+    fi
+    curl --fail --silent --show-error \
+      --connect-timeout 5 --max-time 60 \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+      "${origin}/admin/jobs/${2}"
+    ;;
+  *)
+    usage
+    ;;
+esac
+echo

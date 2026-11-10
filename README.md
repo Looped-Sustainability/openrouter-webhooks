@@ -20,7 +20,7 @@ The caller can also retrieve the job's status. Polling does not replace webhook 
 Use Go 1.25 or later on Linux or macOS.
 
 ```sh
-cp .env.example .env
+cp .env.sample .env
 openssl rand -base64 32
 ```
 
@@ -184,7 +184,7 @@ The result keeps the proxy job ID. `upstream_id` holds OpenRouter's original ID 
 
 A model timeout produces `failed`. A process stop during a model call produces `incomplete`. The proxy can preserve a provider's `cancelled` result, but it has no caller cancellation operation.
 
-Use a signing secret with at least 32 random bytes encoded as base64. The usual format is `whsec_` followed by that value. A bare base64 value also works. If you omit `webhook_secret`, save the generated value from the initial response's `X-Webhook-Secret` header.
+Use a signing secret with at least 32 random bytes encoded as base64. A valid value is `whsec_` plus the output of `openssl rand -base64 32`. A bare base64 value also works. If you omit `webhook_secret`, save the generated value from the initial response's `X-Webhook-Secret` header.
 
 The official OpenAI SDK verifies the webhook signature:
 
@@ -246,6 +246,7 @@ Request bodies, response bodies, caller tokens, signing secrets, webhook URLs, a
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATA_ENCRYPTION_KEY` | Required | Base64-encoded 32-byte key for queued caller credentials. |
+| `ADMIN_TOKEN` | Empty | Shared secret for `GET /admin/jobs`. Empty disables that API. |
 | `ADDR` | `:8080` | HTTP listen address. |
 | `DATA_DIR` | `./data` | Durable job directory. |
 | `WEBHOOK_HOSTS` | Empty | Optional comma-separated exact host list. Empty allows any public HTTPS host. |
@@ -262,6 +263,19 @@ Text request bodies have a 1 MiB limit. Model responses have a 16 MiB limit. A f
 Read-only upstream routes pass through with the caller's token. Other submission routes return HTTP 404. `GET /healthz` needs no token. It returns HTTP 503 after a storage failure; the proxy then stops text admission and scheduling until restart.
 
 The proxy requires public HTTPS webhook destinations on port 443. It checks DNS addresses when it connects and blocks private and reserved networks. It does not use environment HTTP proxies.
+
+## Read stored jobs
+
+Put `ADMIN_TOKEN` and `ADMIN_API_HOST` in the gitignored `.env`. `bin/admin_api` reads that file. Generate the token once with `openssl rand -base64 32`, and put the same token in the Hatchbox app environment. An empty token on the server leaves `GET /admin/jobs` disabled. `ADMIN_API_HOST` is the server origin. The server does not read it.
+
+```sh
+bin/admin_api ls
+bin/admin_api show chatcmpl_proxy_0123456789abcdef0123456789abcdef
+```
+
+`ls` prints one JSON object with a `jobs` array. Each item has `id`, `state`, `model`, `path`, `updated_at`, and `result_status`. `show` prints the stored job. The model output is the `result` field. A queued job still has `request`. A finished job has `result` and no longer has the prompt.
+
+Send `Authorization: Bearer $ADMIN_TOKEN`. Any other token gets HTTP 401. The public text API still uses each caller's OpenRouter key.
 
 ## Docker and Hatchbox deployment
 

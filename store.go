@@ -40,7 +40,7 @@ type job struct {
 	Fingerprint    string              `json:"fingerprint,omitempty"`
 	Event          *event              `json:"event,omitempty"`
 	Attempts       int                 `json:"webhook_attempts"`
-	NextAttempt    time.Time           `json:"next_attempt,omitempty"`
+	NextAttempt    time.Time           `json:"next_attempt,omitzero"`
 	DeliveryError  string              `json:"delivery_error,omitempty"`
 }
 type store struct {

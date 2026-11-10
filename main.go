@@ -17,7 +17,7 @@ import (
 var buildRevision = "development"
 
 type config struct {
-	Addr, DataDir                                          string
+	Addr, DataDir, AdminToken                              string
 	EncryptionKey                                          []byte
 	WebhookHosts                                           map[string]bool
 	Workers, DeliveryWorkers, MaxJobs, MaxDeliveryAttempts int
@@ -31,7 +31,7 @@ func env(key, fallback string) string {
 	return fallback
 }
 func loadConfig() (config, error) {
-	c := config{Addr: env("ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), WebhookHosts: map[string]bool{}}
+	c := config{Addr: env("ADDR", ":8080"), DataDir: env("DATA_DIR", "./data"), AdminToken: os.Getenv("ADMIN_TOKEN"), WebhookHosts: map[string]bool{}}
 	var err error
 	c.EncryptionKey, err = base64.StdEncoding.DecodeString(os.Getenv("DATA_ENCRYPTION_KEY"))
 	if err != nil || len(c.EncryptionKey) != 32 {

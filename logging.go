@@ -56,8 +56,11 @@ func accessLog(next http.Handler) http.Handler {
 
 // Log route labels, never arbitrary paths or query strings supplied by callers.
 func logRoute(path string) string {
-	if path == "/healthz" {
+	if path == "/healthz" || path == "/admin/jobs" {
 		return path
+	}
+	if strings.HasPrefix(path, "/admin/jobs/") {
+		return "/admin/jobs/{id}"
 	}
 	if strings.HasPrefix(path, "/api/v1/") {
 		path = strings.TrimPrefix(path, "/api/v1")

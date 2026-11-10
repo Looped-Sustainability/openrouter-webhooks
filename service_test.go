@@ -497,3 +497,44 @@ func TestWebhookIsRequiredForEveryTextRequest(t *testing.T) {
 		t.Fatal("webhook job did not finish exactly once")
 	}
 }
+
+func TestAdminAPIReadsStoredJobs(t *testing.T) {
+	c := testConfig(t)
+	c.AdminToken = "shared-admin-token"
+	s, api := fixture(t, c, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("admin read called OpenRouter")
+	}, func(http.ResponseWriter, *http.Request) {})
+	id := "chatcmpl_proxy_0123456789abcdef0123456789abcdef"
+	now := time.Date(2026, 11, 10, 18, 1, 0, 0, time.UTC)
+	record := &job{
+		Version: 2, ID: id, Owner: strings.Repeat("ab", 32), Path: "/chat/completions",
+		Model: "openrouter/auto", State: "delivered", CreatedAt: now, UpdatedAt: now,
+		WebhookURL: "https://example.com/hook", WebhookSecret: "whsec_example",
+		Result:   json.RawMessage(`{"status":"completed","choices":[{"message":{"content":"Hello from the model."}}]}`),
+		Attempts: 1,
+	}
+	s.store.mu.Lock()
+	saved := s.persist(record)
+	s.store.mu.Unlock()
+	if !saved {
+		t.Fatal("persist")
+	}
+
+	if code, _, _ := requestTest(t, api, "GET", "/admin/jobs/"+id, "caller-openrouter-key", "", ""); code != 401 {
+		t.Fatalf("caller token status %d", code)
+	}
+	code, _, got := requestTest(t, api, "GET", "/admin/jobs/"+id, "shared-admin-token", "", "")
+	if code != 200 || !strings.Contains(string(got["result"]), "Hello from the model.") || !strings.Contains(string(got["webhook_secret"]), "whsec_example") {
+		t.Fatalf("show %d %s", code, got)
+	}
+	code, _, list := requestTest(t, api, "GET", "/admin/jobs", "shared-admin-token", "", "")
+	if code != 200 || !strings.Contains(string(list["jobs"]), id) {
+		t.Fatalf("list %d %s", code, list)
+	}
+
+	off := testConfig(t)
+	_, quiet := fixture(t, off, func(http.ResponseWriter, *http.Request) {}, func(http.ResponseWriter, *http.Request) {})
+	if code, _, _ := requestTest(t, quiet, "GET", "/admin/jobs", "shared-admin-token", "", ""); code != 404 {
+		t.Fatalf("disabled admin status %d", code)
+	}
+}

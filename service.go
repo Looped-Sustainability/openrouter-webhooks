@@ -79,6 +79,10 @@ func (s *service) handler() http.Handler {
 			}
 			return
 		}
+		if r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/") {
+			s.admin(w, r)
+			return
+		}
 		token := bearer(r)
 		if token == "" {
 			apiError(w, 401, "a bearer token is required")
