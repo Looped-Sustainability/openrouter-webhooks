@@ -273,7 +273,7 @@ bin/admin_api ls
 bin/admin_api show chatcmpl_proxy_0123456789abcdef0123456789abcdef
 ```
 
-`ls` prints one JSON object with a `jobs` array. Each item has `id`, `state`, `model`, `path`, `updated_at`, and `result_status`. `show` prints the stored job. The model output is the `result` field. A queued job still has `request`. A finished job has `result` and no longer has the prompt.
+`ls` prints a table with the job id, delivery state, model result, model, and update time. `show` prints the stored record as a table, then the model text. A queued job still has `request`. A finished job has the model text and no longer has the prompt.
 
 Send `Authorization: Bearer $ADMIN_TOKEN`. Any other token gets HTTP 401. The public text API still uses each caller's OpenRouter key.
 
