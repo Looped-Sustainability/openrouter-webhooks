@@ -477,7 +477,7 @@ func TestWebhookIsRequiredForEveryTextRequest(t *testing.T) {
 			}
 		}
 	}
-	for _, path := range []string{"/v1/completions", "/v1/messages", "/v1/other-text-route"} {
+	for _, path := range []string{"/v1/completions", "/v1/messages", "/v1/systemone", "/v1/other-text-route"} {
 		code, _, _ := requestTest(t, api, "POST", path, "caller", `{"model":"test/model"}`, "")
 		if code != 404 {
 			t.Errorf("unsupported submission route %s returned %d", path, code)

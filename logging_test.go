@@ -26,6 +26,35 @@ func (c *logCapture) Write(data []byte) (int, error) {
 }
 func (c *logCapture) String() string { c.mu.Lock(); defer c.mu.Unlock(); return c.data.String() }
 
+func TestLogRouteLabels(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/v1/chat/completions", "/chat/completions"},
+		{"/api/v1/responses", "/responses"},
+		{"/v1/messages", "/messages"},
+		{"/v1/systemone", "/systemone"},
+		{"/baseten/v1/chat/completions", "/chat/completions"},
+		{"/baseten/v1/responses", "/responses"},
+		{"/baseten/v1/messages", "/messages"},
+		{"/baseten/v1/messages/msg_proxy_abc", "/messages/{id}"},
+		{"/baseten/v1/messages/msg_proxy_abc/redeliver", "/messages/{id}/redeliver"},
+		{"/baseten/v1/systemone", "/systemone"},
+		{"/baseten/v1/systemone/sys_proxy_abc", "/systemone/{id}"},
+		{"/baseten/v1/systemone/sys_proxy_abc/redeliver", "/systemone/{id}/redeliver"},
+		{"/baseten/v1/chat/completions/chatcmpl_proxy_abc", "/chat/completions/{id}"},
+		{"/baseten/v1/responses/resp_proxy_abc/redeliver", "/responses/{id}/redeliver"},
+		{"/baseten/v1/models", "upstream"},
+		{"/api/v1/chat/completions/chatcmpl_proxy_abc/redeliver", "/chat/completions/{id}/redeliver"},
+	} {
+		got := logRoute(tc.path)
+		if got != tc.want {
+			t.Errorf("logRoute(%q)=%q want %q", tc.path, got, tc.want)
+		}
+		if strings.Contains(got, "proxy_") || strings.Contains(got, "msg_proxy") || strings.Contains(got, "sys_proxy") {
+			t.Errorf("logRoute leaked id in %q", got)
+		}
+	}
+}
+
 func TestRequestAndJobLogsExcludeSecrets(t *testing.T) {
 	capture := new(logCapture)
 	previous := slog.Default()

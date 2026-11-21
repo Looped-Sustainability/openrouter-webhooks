@@ -37,11 +37,15 @@ func (s *service) complete(ctx context.Context, j *job) {
 	slog.Info("model request started", "job_id", j.ID, "route", j.Path)
 	var data []byte
 	statusCode := 0
+	provider := jobProvider(j)
 	status, message := "failed", "OpenRouter request failed"
+	if provider == "baseten" {
+		message = "Baseten request failed"
+	}
 	token, err := openCredential(s.c.EncryptionKey, j.ID, j.Credential)
 	if err == nil {
 		var req *http.Request
-		req, err = http.NewRequestWithContext(ctx, "POST", s.upstream+j.Path, bytes.NewReader(j.Request))
+		req, err = http.NewRequestWithContext(ctx, "POST", s.providerURL(provider)+j.Path, bytes.NewReader(j.Request))
 		if err == nil {
 			req.Header = http.Header(j.Headers).Clone()
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -57,7 +61,7 @@ func (s *service) complete(ctx context.Context, j *job) {
 					err = errors.New("upstream response exceeds limit")
 				}
 				if err == nil {
-					status, message = responseStatus(data, statusCode)
+					status, message = responseStatus(data, statusCode, j.Path, provider)
 				}
 			}
 		}
@@ -69,6 +73,9 @@ func (s *service) complete(ctx context.Context, j *job) {
 			message = "Process stopped during model call; upstream outcome is unknown"
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			message = "OpenRouter request timed out; upstream outcome is unknown"
+			if provider == "baseten" {
+				message = "Baseten request timed out; upstream outcome is unknown"
+			}
 		}
 	}
 	j.finish(data, statusCode, status, message)

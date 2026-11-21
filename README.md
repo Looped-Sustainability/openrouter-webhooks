@@ -151,6 +151,68 @@ For Responses, use `client.beta.responses.send({ responsesRequest: { model, inpu
 
 A nonempty webhook header overrides its matching JSON field. The proxy removes these headers before it calls OpenRouter. The OpenRouter SDK removes unknown response fields too, so use the retrieval endpoint to inspect the added chat completion `status` field.
 
+## Baseten
+
+Replace `https://inference.baseten.co` with `https://your-proxy.example/baseten`. The same webhook rules apply. There is no synchronous text mode.
+
+Set the OpenAI SDK `baseURL` to `https://your-proxy.example/baseten/v1` and pass a Baseten API key. Set the Anthropic SDK `baseURL` to `https://your-proxy.example/baseten` and send `Authorization: Bearer <BASETEN_API_KEY>` in `defaultHeaders`, as described in [Baseten's Model APIs](https://docs.baseten.co/inference/model-apis/overview). System One is `POST /baseten/v1/systemone`.
+
+```js
+import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
+
+const openai = new OpenAI({
+  apiKey: process.env.BASETEN_API_KEY,
+  baseURL: 'https://your-proxy.example/baseten/v1',
+});
+
+const anthropic = new Anthropic({
+  apiKey: process.env.BASETEN_API_KEY,
+  baseURL: 'https://your-proxy.example/baseten',
+  defaultHeaders: { Authorization: `Bearer ${process.env.BASETEN_API_KEY}` },
+});
+
+const queuedChat = await openai.chat.completions.create({
+  model: 'zai-org/GLM-5.3',
+  messages: [{ role: 'user', content: 'Write a short greeting.' }],
+  webhook_url: 'https://hooks.example.com/result',
+});
+
+const queuedMessage = await anthropic.messages.create(
+  {
+    model: 'zai-org/GLM-5.3',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: 'Write a short greeting.' }],
+  },
+  {
+    headers: {
+      'X-Webhook-URL': 'https://hooks.example.com/result',
+      'X-Webhook-Secret': process.env.MY_WEBHOOK_SECRET,
+    },
+  },
+);
+```
+
+| Method | Path under `/baseten/v1` | Purpose |
+| --- | --- | --- |
+| `POST` | `/chat/completions` | Queue a chat completion with a required webhook. |
+| `POST` | `/responses` | Queue a Responses request with a required webhook. |
+| `POST` | `/messages` | Queue an Anthropic Messages request with a required webhook. |
+| `POST` | `/systemone` | Queue a System One request with a required webhook. |
+| `GET` | `/chat/completions/{id}` | Retrieve a chat completion job. |
+| `GET` | `/responses/{id}` | Retrieve a Responses job. |
+| `GET` | `/messages/{id}` | Retrieve a Messages job. |
+| `GET` | `/systemone/{id}` | Retrieve a System One job. |
+| `POST` | `/chat/completions/{id}/redeliver` | Retry an exhausted chat completion delivery. |
+| `POST` | `/responses/{id}/redeliver` | Retry an exhausted Responses delivery. |
+| `POST` | `/messages/{id}/redeliver` | Retry an exhausted Messages delivery. |
+| `POST` | `/systemone/{id}/redeliver` | Retry an exhausted System One delivery. |
+| `GET` | `/models` | Pass through to Baseten. No webhook required. |
+
+A queued Messages body uses `type: "message"`, empty `content`, and a `msg_proxy_` ID. A queued System One body uses `object: "systemone"`, empty `answers`, and a `sys_proxy_` ID. Completed events are `message.completed` and `systemone.completed`. `POST /v1/messages` and `POST /v1/systemone` return HTTP 404.
+
+Send the caller key as `Authorization: Bearer`.
+
 ## Receive and verify the webhook
 
 The webhook receives an event with the full final result in `data`. A chat completion event looks like this; the result here is shortened:
@@ -320,6 +382,6 @@ go test -race -count=1 -timeout=120s -v ./...
 go build ./...
 ```
 
-Tests use the pinned official `openai` and `@openrouter/sdk` packages. They cover required webhook rejection, asynchronous chat and Responses calls, token isolation, status retrieval, errors, and signature verification. Queue tests also cover delivery retries, restart recovery, encrypted credentials, and 300 simultaneous model calls.
+Tests use the pinned official `openai`, `@openrouter/sdk`, and `@anthropic-ai/sdk` packages. They cover required webhook rejection, asynchronous chat, Responses, and Messages calls, token isolation, status retrieval, errors, and signature verification. Queue tests also cover delivery retries, restart recovery, encrypted credentials, and 300 simultaneous model calls.
 
-The tests use local providers and HTTP/TLS connections in memory. They make no paid OpenRouter or OpenAI calls. The concurrency test proves local proxy behavior; production capacity also depends on the server and OpenRouter account limits.
+The tests use local providers and HTTP/TLS connections in memory. They make no paid OpenRouter, OpenAI, or Baseten calls. The concurrency test proves local proxy behavior; production capacity also depends on the server and upstream account limits.

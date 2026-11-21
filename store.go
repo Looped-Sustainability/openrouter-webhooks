@@ -26,6 +26,7 @@ type job struct {
 	ID             string              `json:"id"`
 	Owner          string              `json:"owner"`
 	Path           string              `json:"path"`
+	Provider       string              `json:"provider,omitempty"`
 	Model          string              `json:"model"`
 	State          string              `json:"state"`
 	CreatedAt      time.Time           `json:"created_at"`
