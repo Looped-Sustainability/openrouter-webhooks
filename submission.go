@@ -12,7 +12,7 @@ import (
 )
 
 func nowUTC() time.Time { return time.Now().UTC() }
-func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path string, body map[string]json.RawMessage) {
+func (s *service) submit(w http.ResponseWriter, r *http.Request, token, provider, path string, body map[string]json.RawMessage) {
 	if s.failed.Load() {
 		apiError(w, 503, "storage failure")
 		return
@@ -85,10 +85,15 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 	headers.Del("Cookie")
 	headers.Del("Connection")
 	headers.Del("Accept-Encoding")
+	storedProvider := ""
+	if provider == "baseten" {
+		storedProvider = "baseten"
+	}
 	encoded, _ := json.Marshal(struct {
 		Path, Webhook, Secret string
+		Provider              string `json:",omitempty"`
 		Body                  json.RawMessage
-	}{path, webhook, secret, raw})
+	}{path, webhook, secret, storedProvider, raw})
 	sum := sha256.Sum256(encoded)
 	fingerprint := hex.EncodeToString(sum[:])
 	owner := ownerID(token)
@@ -113,11 +118,8 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 		apiError(w, 503, "job store is full")
 		return
 	}
-	prefix := "resp_proxy_"
-	if path == "/chat/completions" {
-		prefix = "chatcmpl_proxy_"
-	}
-	id := prefix + newID()
+	route, _ := lookupTextAPI(path, provider)
+	id := route.idPrefix + newID()
 	credential, err := sealCredential(s.c.EncryptionKey, id, token)
 	if err != nil {
 		apiError(w, 503, "could not encrypt credential")
@@ -127,7 +129,7 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 		secret = newSigningSecret()
 	}
 	now := nowUTC()
-	j := &job{Version: 2, ID: id, Owner: owner, Path: path, Model: model, State: "queued", CreatedAt: now, UpdatedAt: now, WebhookURL: webhook, WebhookSecret: secret, Credential: credential, Headers: headers, Request: raw, IdempotencyKey: key, Fingerprint: fingerprint}
+	j := &job{Version: 2, ID: id, Owner: owner, Path: path, Provider: storedProvider, Model: model, State: "queued", CreatedAt: now, UpdatedAt: now, WebhookURL: webhook, WebhookSecret: secret, Credential: credential, Headers: headers, Request: raw, IdempotencyKey: key, Fingerprint: fingerprint}
 	if !s.persist(j) {
 		apiError(w, 503, "could not persist job")
 		return
@@ -136,20 +138,20 @@ func (s *service) submit(w http.ResponseWriter, r *http.Request, token, path str
 	accepted(w, j)
 }
 func accepted(w http.ResponseWriter, j *job) {
-	w.Header().Set("Location", "/api/v1"+j.Path+"/"+j.ID)
+	w.Header().Set("Location", apiPrefix(jobProvider(j))+j.Path+"/"+j.ID)
 	if j.WebhookSecret != "" {
 		w.Header().Set("X-Webhook-Secret", j.WebhookSecret)
 	}
 	writeJSON(w, 200, json.RawMessage(j.response()))
 }
-func (s *service) localJob(w http.ResponseWriter, r *http.Request, token, path, id string) {
+func (s *service) localJob(w http.ResponseWriter, r *http.Request, token, provider, path, id string) {
 	redeliver := strings.HasSuffix(id, "/redeliver")
 	id = strings.TrimSuffix(id, "/redeliver")
 	st := s.store
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	j := st.jobs[id]
-	if j == nil || j.Owner != ownerID(token) || j.Path != path {
+	if j == nil || j.Owner != ownerID(token) || j.Path != path || jobProvider(j) != provider {
 		apiError(w, 404, "response not found")
 		return
 	}
@@ -187,10 +189,11 @@ func (s *service) localJob(w http.ResponseWriter, r *http.Request, token, path, 
 	apiError(w, 400, "this operation is not supported for proxy background jobs")
 }
 
-func responseStatus(data []byte, httpStatus int) (string, string) {
+func responseStatus(data []byte, httpStatus int, path, provider string) (string, string) {
 	var body struct {
 		Error   json.RawMessage `json:"error"`
 		Status  string          `json:"status"`
+		Type    string          `json:"type"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -198,18 +201,40 @@ func responseStatus(data []byte, httpStatus int) (string, string) {
 	if json.Unmarshal(data, &body) != nil || bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return "failed", "upstream returned invalid JSON"
 	}
-	if httpStatus < 200 || httpStatus >= 300 || (len(body.Error) > 0 && !bytes.Equal(bytes.TrimSpace(body.Error), []byte("null"))) {
-		return "failed", "OpenRouter returned an error"
+	failedMsg := "OpenRouter returned an error"
+	incompleteMsg := "OpenRouter did not complete the response"
+	completionErr := "OpenRouter returned a completion error"
+	if provider == "baseten" {
+		failedMsg = "Baseten returned an error"
+		incompleteMsg = "Baseten did not complete the response"
+		completionErr = "Baseten returned a completion error"
+	}
+	hasError := len(body.Error) > 0 && !bytes.Equal(bytes.TrimSpace(body.Error), []byte("null"))
+	badHTTP := httpStatus < 200 || httpStatus >= 300
+	if path == "/messages" {
+		if badHTTP || body.Type == "error" || hasError {
+			return "failed", failedMsg
+		}
+		return "completed", ""
+	}
+	if path == "/systemone" {
+		if badHTTP || hasError {
+			return "failed", failedMsg
+		}
+		return "completed", ""
+	}
+	if badHTTP || hasError {
+		return "failed", failedMsg
 	}
 	if body.Status == "failed" || body.Status == "incomplete" || body.Status == "cancelled" {
-		return body.Status, "OpenRouter did not complete the response"
+		return body.Status, incompleteMsg
 	}
 	if body.Status == "queued" || body.Status == "in_progress" {
 		return "incomplete", "upstream returned a pending result when a final result was required"
 	}
 	for _, choice := range body.Choices {
 		if choice.FinishReason == "error" {
-			return "failed", "OpenRouter returned a completion error"
+			return "failed", completionErr
 		}
 	}
 	return "completed", ""

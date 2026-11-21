@@ -62,22 +62,19 @@ func logRoute(path string) string {
 	if strings.HasPrefix(path, "/admin/jobs/") {
 		return "/admin/jobs/{id}"
 	}
-	if strings.HasPrefix(path, "/api/v1/") {
-		path = strings.TrimPrefix(path, "/api/v1")
-	} else if strings.HasPrefix(path, "/v1/") {
-		path = strings.TrimPrefix(path, "/v1")
-	} else {
+	_, path, ok := publicRoute(path)
+	if !ok {
 		return "unknown"
 	}
-	for _, base := range []string{"/chat/completions", "/responses"} {
-		if path == base {
-			return base
+	for _, api := range textAPIs {
+		if path == api.path {
+			return api.path
 		}
-		if strings.HasPrefix(path, base+"/") {
+		if strings.HasPrefix(path, api.path+"/") {
 			if strings.HasSuffix(path, "/redeliver") {
-				return base + "/{id}/redeliver"
+				return api.path + "/{id}/redeliver"
 			}
-			return base + "/{id}"
+			return api.path + "/{id}"
 		}
 	}
 	return "upstream"

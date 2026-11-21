@@ -17,11 +17,23 @@ import (
 const maxRequestBytes = 1 << 20
 const maxResponseBytes = 16 << 20
 
+type textAPI struct {
+	path, idPrefix, eventPrefix string
+	providers                   []string
+}
+
+var textAPIs = []textAPI{
+	{"/chat/completions", "chatcmpl_proxy_", "chat.completion.", []string{"openrouter", "baseten"}},
+	{"/responses", "resp_proxy_", "response.", []string{"openrouter", "baseten"}},
+	{"/messages", "msg_proxy_", "message.", []string{"baseten"}},
+	{"/systemone", "sys_proxy_", "systemone.", []string{"baseten"}},
+}
+
 type service struct {
 	c                          config
 	store                      *store
 	modelClient, webhookClient *http.Client
-	upstream                   string
+	upstream, baseten          string
 	slots                      chan struct{}
 	wg                         sync.WaitGroup
 	failed                     atomic.Bool
@@ -69,6 +81,78 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func apiError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "proxy_error", "code": status}})
 }
+func publicRoute(urlPath string) (provider, path string, ok bool) {
+	switch {
+	case strings.HasPrefix(urlPath, "/baseten/v1/"):
+		return "baseten", strings.TrimPrefix(urlPath, "/baseten/v1"), true
+	case strings.HasPrefix(urlPath, "/api/v1/"):
+		return "openrouter", strings.TrimPrefix(urlPath, "/api/v1"), true
+	case strings.HasPrefix(urlPath, "/v1/"):
+		return "openrouter", strings.TrimPrefix(urlPath, "/v1"), true
+	default:
+		return "", "", false
+	}
+}
+func lookupTextAPI(path, provider string) (textAPI, bool) {
+	for _, api := range textAPIs {
+		if api.path != path {
+			continue
+		}
+		for _, allowed := range api.providers {
+			if allowed == provider {
+				return api, true
+			}
+		}
+		return textAPI{}, false
+	}
+	return textAPI{}, false
+}
+func localJobID(id string) bool {
+	for _, api := range textAPIs {
+		if strings.HasPrefix(id, api.idPrefix) {
+			return true
+		}
+	}
+	return false
+}
+func eventPrefix(path string) string {
+	for _, api := range textAPIs {
+		if api.path == path {
+			return api.eventPrefix
+		}
+	}
+	return "chat.completion."
+}
+func jobProvider(j *job) string {
+	if j.Provider == "baseten" {
+		return "baseten"
+	}
+	return "openrouter"
+}
+func apiPrefix(provider string) string {
+	if provider == "baseten" {
+		return "/baseten/v1"
+	}
+	return "/api/v1"
+}
+func textSubmissionError(provider string) string {
+	if provider == "baseten" {
+		return "only chat completions, Responses, Messages, and System One support text submission through this proxy"
+	}
+	return "only chat completions and Responses support text submission through this proxy"
+}
+func (s *service) providerURL(provider string) string {
+	if provider == "baseten" {
+		if s.baseten != "" {
+			return s.baseten
+		}
+		return "https://inference.baseten.co/v1"
+	}
+	if s.upstream != "" {
+		return s.upstream
+	}
+	return "https://openrouter.ai/api/v1"
+}
 func (s *service) handler() http.Handler {
 	return accessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -88,43 +172,44 @@ func (s *service) handler() http.Handler {
 			apiError(w, 401, "a bearer token is required")
 			return
 		}
-		path := r.URL.Path
-		if strings.HasPrefix(path, "/api/v1/") {
-			path = strings.TrimPrefix(path, "/api/v1")
-		} else if strings.HasPrefix(path, "/v1/") {
-			path = strings.TrimPrefix(path, "/v1")
-		} else {
-			apiError(w, 404, "use the /api/v1 or /v1 base URL")
+		provider, path, ok := publicRoute(r.URL.Path)
+		if !ok {
+			apiError(w, 404, "use the /api/v1, /v1, or /baseten/v1 base URL")
 			return
 		}
-		for _, base := range []string{"/responses/", "/chat/completions/"} {
+		for _, api := range textAPIs {
+			base := api.path + "/"
 			if strings.HasPrefix(path, base) {
 				id := strings.TrimPrefix(path, base)
-				if strings.HasPrefix(id, "resp_proxy_") || strings.HasPrefix(id, "chatcmpl_proxy_") {
-					s.localJob(w, r, token, strings.TrimSuffix(base, "/"), id)
+				if localJobID(id) {
+					s.localJob(w, r, token, provider, api.path, id)
 					return
 				}
 			}
 		}
-		if r.Method == "POST" && (path == "/chat/completions" || path == "/responses") {
-			raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-			if err != nil {
-				apiError(w, 413, "request exceeds 1 MiB")
+		if r.Method == "POST" {
+			if _, ok := lookupTextAPI(path, provider); ok {
+				raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+				if err != nil {
+					apiError(w, 413, "request exceeds 1 MiB")
+					return
+				}
+				var body map[string]json.RawMessage
+				if err = json.Unmarshal(raw, &body); err != nil || body == nil {
+					apiError(w, 400, "expected a JSON object")
+					return
+				}
+				s.submit(w, r, token, provider, path, body)
 				return
 			}
-			var body map[string]json.RawMessage
-			if err = json.Unmarshal(raw, &body); err != nil || body == nil {
-				apiError(w, 400, "expected a JSON object")
-				return
-			}
-			s.submit(w, r, token, path, body)
+			apiError(w, 404, textSubmissionError(provider))
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			apiError(w, 404, "only chat completions and Responses support text submission through this proxy")
+			apiError(w, 404, textSubmissionError(provider))
 			return
 		}
-		s.forward(w, r, path)
+		s.forward(w, r, path, provider)
 	}))
 }
 func stripProxyHeaders(h http.Header) {
@@ -135,7 +220,7 @@ func stripProxyHeaders(h http.Header) {
 		}
 	}
 }
-func (s *service) forward(w http.ResponseWriter, r *http.Request, path string) {
+func (s *service) forward(w http.ResponseWriter, r *http.Request, path, provider string) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.c.ModelTimeout)
 	defer cancel()
 	select {
@@ -145,7 +230,7 @@ func (s *service) forward(w http.ResponseWriter, r *http.Request, path string) {
 		apiError(w, 504, "upstream request timed out waiting for capacity")
 		return
 	}
-	target, err := url.Parse(s.upstream)
+	target, err := url.Parse(s.providerURL(provider))
 	if err != nil {
 		apiError(w, 502, "upstream configuration error")
 		return
