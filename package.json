@@ -6,7 +6,8 @@
     "test": "go test -race -count=1 -timeout=120s ./..."
   },
   "devDependencies": {
-    "openai": "7.53.0",
-    "@openrouter/sdk": "1.5.61"
+    "@anthropic-ai/sdk": "1.12.0",
+    "@openrouter/sdk": "1.5.61",
+    "openai": "7.53.0"
   }
 }
